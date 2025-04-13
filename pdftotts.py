@@ -24,6 +24,7 @@ import tempfile
 import datetime # Import datetime for append message
 import shutil # Import for directory removal
 import json # Import JSON for parsing state
+import concurrent.futures # <--- Added for threading
 
 # --- ADDED: Import PyPDF2 ---
 try:
@@ -42,7 +43,6 @@ from camel.messages import BaseMessage
 from camel.types import ModelPlatformType, ModelType, UnifiedModelType
 
 # --- Model Definitions (Example Unified Models) ---
-# (Keep your existing model definitions or use ModelType directly)
 class mymodel(UnifiedModelType, Enum):
     OPENROUTER_QUASAR = "openrouter/quasar-alpha"
     OPENROUTER_SCOUT = "meta-llama/llama-4-scout:free"
@@ -53,6 +53,7 @@ class mymodel(UnifiedModelType, Enum):
     OPENROUTER_GEMINI_LEARN_LM = "google/learnlm-1.5-pro-experimental:free"
     OPENROUTER_QWEN_2_5_VL_3B = "qwen/qwen2.5-vl-3b-instruct:free"
     OPENROUTER_QWEN_2_5_VL_32B = "qwen/qwen2.5-vl-32b-instruct:free"
+
 
 # --- Prompt Templates ---
 # Transcription Prompt (Keep PROMPT_TEMPLATE as before)
@@ -175,7 +176,6 @@ PROMPT_TOC_ANALYSIS = """
 **Now, analyze the provided TOC text and return the JSON output.**
 """
 
-
 # --- Logging Setup ---
 logger = logging.getLogger(__name__)
 # Basic config will be set later based on args
@@ -219,46 +219,56 @@ def extract_page_number(filename: Path) -> Optional[int]:
             logger.warning(f"Could not extract page number (format '-digits.' or 'digits.') from filename: {filename.name}")
             return None
 
-def create_temporary_composite_image(image_paths: List[Path], output_dir: Path, base_name: str) -> Optional[Path]:
-    """Creates a temporary composite image from exactly 3 images using ImageMagick's montage tool."""
+# --- MODIFIED: Helper Function to generate composite image (can be run in thread) ---
+def create_composite_image_task(image_paths: List[Path], output_dir: Path, base_name: str) -> Optional[Path]:
+    """Creates a temporary composite image from exactly 3 images using ImageMagick's montage tool.
+    This is the function to be executed in a background thread."""
     if not image_paths or len(image_paths) != 3:
-        logger.warning(f"Cannot create composite: Need exactly 3 image paths, got {len(image_paths)} for base {base_name}.")
+        logger.warning(f"Cannot create composite task: Need exactly 3 image paths, got {len(image_paths)} for base {base_name}.")
         return None
 
     # Ensure all input paths actually exist before attempting montage
     missing_files = [p for p in image_paths if not p.exists()]
     if missing_files:
-        logger.error(f"Cannot create composite: Missing input image(s): {[str(p.name) for p in missing_files]} for base {base_name}.")
+        logger.error(f"Cannot create composite task: Missing input image(s): {[str(p.name) for p in missing_files]} for base {base_name}.")
         return None
 
     image_paths_str = ' '.join(f'"{path}"' for path in image_paths)
+    # Composites will go directly into the pdf_image_dir/.composites now
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{base_name}_composite.png"
+
+    # If composite already exists, return it (might happen on retry/overlap)
+    if output_path.exists():
+        logger.debug(f"Composite image {output_path.name} already exists. Returning path.")
+        return output_path
+
     command = f"montage -mode concatenate -tile x1 {image_paths_str} \"{output_path}\""
 
     try:
-        logger.debug(f"Running montage command: {command}")
+        logger.debug(f"Running montage command in background thread: {command}")
         result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, encoding='utf-8')
         if output_path.exists():
-            logger.info(f"Temporary composite image created: {output_path}")
+            logger.info(f"Background task created composite image: {output_path.name}")
             return output_path
         else:
-             logger.error(f"Montage command ran but output file not found: {output_path}")
-             logger.error(f"Montage stdout: {result.stdout}")
-             logger.error(f"Montage stderr: {result.stderr}")
+             logger.error(f"Montage command ran (bg) but output file not found: {output_path.name}")
+             logger.error(f"Montage (bg) stdout: {result.stdout}")
+             logger.error(f"Montage (bg) stderr: {result.stderr}")
              return None
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error creating composite image with command '{command}': {e}")
-        logger.error(f"Montage stdout: {e.stdout}")
-        logger.error(f"Montage stderr: {e.stderr}")
-        return None
+        logger.error(f"Error creating composite image (bg) with command '{command}': {e}")
+        logger.error(f"Montage (bg) stdout: {e.stdout}")
+        logger.error(f"Montage (bg) stderr: {e.stderr}")
+        # Raise the error so the Future captures it
+        raise e
     except FileNotFoundError:
         logger.error("Error: 'montage' command not found. Please ensure ImageMagick is installed and in your system's PATH.")
-        # Raise an exception or return None to stop further processing
         raise RuntimeError("ImageMagick 'montage' command not found.")
     except Exception as e:
-        logger.error(f"Unexpected error creating composite image {base_name}: {e}", exc_info=True)
-        return None
+        logger.error(f"Unexpected error creating composite image {base_name} (bg): {e}", exc_info=True)
+        # Raise the error so the Future captures it
+        raise e
 
 def transcribe_image(
     toolkit: ImageAnalysisToolkit,
@@ -288,6 +298,7 @@ def transcribe_image(
         retries = 0
         while retries < max_retries:
             try:
+                # This is the potentially slow part (API call)
                 transcription = toolkit.ask_question_about_image(
                     image_path=str(image_path),
                     question=final_prompt
@@ -378,7 +389,6 @@ def convert_pdf_page_to_image(
     except Exception:
         padding_width = 3 # Default padding if count fails
     expected_output_filename = f"{pdf_path.stem}-{page_number:0{padding_width}d}.{image_format}"
-    # expected_output_filename = f"{pdf_path.stem}-{page_number:d}.{image_format}" # Use standard formatting # OLD
     expected_output_path = output_dir / expected_output_filename
 
     # If the file already exists, assume it's correct and return path
@@ -438,7 +448,6 @@ def convert_pdf_page_to_image(
         return None
 
 # --- State Management Functions ---
-# --- MODIFIED: load_resume_state to handle new structure ---
 def load_resume_state(state_file_path: Path) -> Dict[str, Any]:
     """
     Loads the resume state from a JSON file.
@@ -515,93 +524,95 @@ def save_resume_state(state_file_path: Path, state_data: Dict[str, Any]):
         logger.error(f"Unexpected error saving state file {state_file_path}: {e}", exc_info=True)
 
 
-# --- REFACTORED: PDF Page Processing Function ---
-# --- MODIFIED: process_pdf_pages updates state correctly ---
+# --- REFACTORED: PDF Page Processing Function with Async Composite Generation ---
 def process_pdf_pages(
     pdf_path: Path,
     num_pdf_pages: int,
-    pdf_image_dir: Path, # Directory for this PDF's temporary images
+    pdf_image_dir: Path,
     output_path: Optional[Path],
     append_mode: bool,
-    start_page: Optional[int], # Effective start page
-    end_page: Optional[int],   # Effective end page
+    start_page: Optional[int],
+    end_page: Optional[int],
     image_toolkit: ImageAnalysisToolkit,
     prompt_template: str,
     initial_context: Optional[str],
-    pdf_filename: str, # Original PDF filename for state tracking
+    pdf_filename: str,
     state_file_path: Optional[Path],
-    state_data: Dict[str, Any], # Pass the whole state dictionary
+    state_data: Dict[str, Any],
     image_format: str = 'png',
-    dpi: int = 300
+    dpi: int = 300,
+    executor: concurrent.futures.ThreadPoolExecutor = None # <--- Added Executor
 ) -> Tuple[bool, Optional[str]]:
     """
-    Processes pages of a PDF by generating images on the fly, transcribing,
-    and cleaning up images in a rolling window.
-
-    Args:
-        pdf_path: Path to the PDF file.
-        num_pdf_pages: Total number of pages in the PDF.
-        pdf_image_dir: Directory to store temporary page images for this PDF.
-        output_path: Path to the output text file (or None for console).
-        append_mode: Whether to append to the output file.
-        start_page: The 1-based page number to start processing from (inclusive).
-        end_page: The 1-based page number to stop processing at (inclusive).
-        image_toolkit: Initialized ImageAnalysisToolkit.
-        prompt_template: The prompt template for transcription.
-        initial_context: Transcription context from previous runs/files.
-        pdf_filename: The name of the PDF file (for state management).
-        state_file_path: Path to the resume state JSON file.
-        state_data: The *entire* loaded resume state dictionary.
-        image_format: Format for temporary images (e.g., 'png').
-        dpi: Resolution for temporary images.
-
-    Returns:
-        A tuple: (success_flag, last_successful_transcription).
+    Processes pages of a PDF with async composite generation.
     """
-    logger.info(f"Processing PDF: {pdf_filename} [Effective Pages {start_page or 1} to {end_page or num_pdf_pages}]")
+    logger.info(f"Processing PDF: {pdf_filename} [Effective Pages {start_page or 1} to {end_page or num_pdf_pages}] with Async Composite")
 
     files_processed_count = 0
     last_successful_transcription = initial_context
     processing_successful = True
-    # Keep track of images currently existing on disk for this PDF
     current_images_on_disk: Set[Path] = set()
+    # Ensure executor exists for this mode
+    if not executor:
+         logger.error("ThreadPoolExecutor must be provided for process_pdf_pages.")
+         return False, initial_context
 
-    # --- Helper to generate image path ---
+    # Define composite directory path
+    temp_composite_dir = pdf_image_dir / ".composites"
+
+    # --- Helper to generate image path (Consistent Naming) ---
     def get_image_path(page_num: int) -> Path:
         # Determine padding dynamically based on total pages
         try:
-            reader = PyPDF2.PdfReader(str(pdf_path)) # Re-read for safety
+            # Cache this? For now, re-read is safer for simplicity
+            reader = PyPDF2.PdfReader(str(pdf_path))
             total_pages = len(reader.pages)
             padding_width = len(str(total_pages))
         except Exception:
             padding_width = 3 # Default padding
-        # pdftoppm uses 0-padding based on total pages. e.g., page 1 of 150 becomes -001
         return pdf_image_dir / f"{pdf_path.stem}-{page_num:0{padding_width}d}.{image_format}"
+
+    # --- Helper to get/generate SINGLE page image ---
+    def ensure_page_image_exists(page_num: int) -> Optional[Path]:
+        """Generates image if missing, tracks it, returns path."""
+        if page_num < 1 or page_num > num_pdf_pages: return None
+        img_path = get_image_path(page_num)
+        if img_path not in current_images_on_disk and not img_path.exists():
+            logger.info(f"Generating missing image for page {page_num}...")
+            generated_path = convert_pdf_page_to_image(
+                pdf_path, page_num, pdf_image_dir, image_format, dpi
+            )
+            if generated_path:
+                current_images_on_disk.add(generated_path)
+                return generated_path
+            else:
+                logger.error(f"Failed to generate required image for page {page_num}.")
+                return None
+        elif img_path.exists():
+             if img_path not in current_images_on_disk: # Track if untracked
+                current_images_on_disk.add(img_path)
+             return img_path
+        else: # Should not happen if logic is correct
+             logger.error(f"Logic error: Image path {img_path.name} not in set and does not exist.")
+             return None
 
     # --- Helper to safely delete an image ---
     def delete_page_image(page_num: int):
-        if page_num < 1: return # Cannot delete non-positive page
+        if page_num < 1: return
         img_path = get_image_path(page_num)
         if img_path in current_images_on_disk:
             try:
                 img_path.unlink()
                 logger.debug(f"Deleted page image: {img_path.name}")
                 current_images_on_disk.remove(img_path)
-            except FileNotFoundError:
-                logger.debug(f"Image {img_path.name} already deleted.")
-                current_images_on_disk.discard(img_path) # Ensure removal from set
-            except OSError as e_del:
-                logger.warning(f"Could not delete page image {img_path.name}: {e_del}")
+            except FileNotFoundError: logger.debug(f"Image {img_path.name} already deleted.")
+            except OSError as e_del: logger.warning(f"Could not delete page image {img_path.name}: {e_del}")
         elif img_path.exists(): # Safety check if not in set but exists
-             try:
-                 img_path.unlink()
-                 logger.debug(f"Deleted stray page image: {img_path.name}")
-             except OSError as e_del_stray:
-                 logger.warning(f"Could not delete stray page image {img_path.name}: {e_del_stray}")
+             try: img_path.unlink(); logger.debug(f"Deleted stray page image: {img_path.name}")
+             except OSError as e_del_stray: logger.warning(f"Could not delete stray page image {img_path.name}: {e_del_stray}")
 
 
     # Ensure temporary directories exist
-    temp_composite_dir = pdf_image_dir / ".composites"
     try:
         pdf_image_dir.mkdir(parents=True, exist_ok=True)
         temp_composite_dir.mkdir(exist_ok=True)
@@ -615,8 +626,7 @@ def process_pdf_pages(
     if output_path and not append_mode:
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f_init:
-                f_init.truncate(0)
+            with open(output_path, 'w', encoding='utf-8') as f_init: f_init.truncate(0)
             logger.info(f"Output file {output_path} truncated (or created).")
         except IOError as e:
             logger.error(f"Error preparing output file {output_path}: {e}")
@@ -631,206 +641,189 @@ def process_pdf_pages(
     # Get the specific state dict for this PDF
     pdf_state = state_data.get(pdf_filename, {}) # Default to empty dict if not present
 
+    # --- Asynchronous Logic ---
+    current_composite_future: Optional[concurrent.futures.Future] = None
+    next_composite_future: Optional[concurrent.futures.Future] = None
+
+    # --- Pre-generate the FIRST required composite (for page `loop_start`) ---
+    first_transcribe_page = loop_start # Usually the first page we can transcribe
+    # Adjust if loop_start is 1 (cannot transcribe page 1)
+    if first_transcribe_page == 1:
+        first_transcribe_page = 2
+
+    if first_transcribe_page <= loop_end: # Only pre-gen if it's within range
+         logger.info(f"Pre-submitting composite generation task for first transcribable page: {first_transcribe_page}")
+         p_prev_first, p_curr_first, p_next_first = first_transcribe_page - 1, first_transcribe_page, first_transcribe_page + 1
+         if p_prev_first >= 1 and p_next_first <= num_pdf_pages: # Check bounds
+             paths_first = [ensure_page_image_exists(p) for p in [p_prev_first, p_curr_first, p_next_first]]
+             if all(paths_first):
+                 base_name_first = f"page_{p_curr_first:04d}"
+                 current_composite_future = executor.submit(
+                     create_composite_image_task, paths_first, temp_composite_dir, base_name_first
+                 )
+                 logger.debug(f"Submitted initial composite task for page {p_curr_first}")
+             else:
+                 logger.error(f"Could not generate necessary page images for the first composite ({p_curr_first}). Cannot start processing.")
+                 processing_successful = False # Mark failure
+         else:
+             logger.info(f"First transcribable page {first_transcribe_page} is too close to edge for pre-generation. Will handle in loop.")
+             # Don't set processing_successful to False here, loop might handle it
+    else:
+        logger.info("No pages within the specified range to process.")
+        processing_successful = True # No failure, just nothing to do
+
+    # --- Main Loop ---
     try:
         for page_num in range(loop_start, loop_end + 1):
+            if not processing_successful: break # Stop if previous iteration failed
+
             logger.info(f"--- Current target page: {page_num}/{loop_end} ({pdf_filename}) ---")
 
-            # --- Check Edge Cases for 3-Page Window ---
-            # Need page_num-1, page_num, page_num+1
+            # --- Calculate page indices for current transcription window ---
             p_prev = page_num - 1
             p_curr = page_num
             p_next = page_num + 1
 
-            if p_prev < 1 or p_next > num_pdf_pages:
-                logger.info(f"Skipping transcription for edge page {page_num}: Cannot form 3-page window (Needs {p_prev} and {p_next}).")
-                # Update state even for skipped edge page IF it's within range and state tracking is active
-                if state_file_path:
-                     logger.debug(f"Updating state to reflect skipped edge page {page_num}")
-                     pdf_state["last_processed"] = page_num # Update specific dict
-                     state_data[pdf_filename] = pdf_state # Put updated dict back
-                     save_resume_state(state_file_path, state_data) # Save entire state
-                # Still need to generate current/next if they are needed for the *next* iteration's window
-                # (Convert only if not already present)
-                curr_path = get_image_path(p_curr)
-                if not curr_path.exists():
-                    # Generate image if it's within overall bounds
-                    if p_curr <= num_pdf_pages:
-                         img_curr = convert_pdf_page_to_image(pdf_path, p_curr, pdf_image_dir, image_format, dpi)
-                         if img_curr: current_images_on_disk.add(img_curr)
-                elif curr_path not in current_images_on_disk: # If exists but not tracked
-                    current_images_on_disk.add(curr_path)
+            # --- Submit NEXT composite generation task (Async) ---
+            # We need to generate composite for page_num + 1
+            next_composite_page_num = page_num + 1
+            # Indices needed for the *next* composite: page_num, page_num+1, page_num+2
+            p_curr_next, p_next_next, p_after_next = next_composite_page_num - 1, next_composite_page_num, next_composite_page_num + 1
 
-                if p_next <= num_pdf_pages:
-                    next_path = get_image_path(p_next)
-                    if not next_path.exists():
-                         img_next = convert_pdf_page_to_image(pdf_path, p_next, pdf_image_dir, image_format, dpi)
-                         if img_next: current_images_on_disk.add(img_next)
-                    elif next_path not in current_images_on_disk:
-                        current_images_on_disk.add(next_path)
-                # Cleanup page - 2 as it's definitely not needed now
-                delete_page_image(page_num - 2)
-                continue # Move to the next page number
-
-            # --- Generate Required Images ---
-            required_paths: Dict[str, Path] = {
-                "prev": get_image_path(p_prev),
-                "curr": get_image_path(p_curr),
-                "next": get_image_path(p_next),
-            }
-            montage_input_paths: List[Path] = []
-            generation_failed = False
-
-            for role, page_idx in [("prev", p_prev), ("curr", p_curr), ("next", p_next)]:
-                img_path = required_paths[role]
-                if img_path not in current_images_on_disk and not img_path.exists():
-                    logger.info(f"Generating missing image for page {page_idx} ({role})...")
-                    generated_path = convert_pdf_page_to_image(
-                        pdf_path, page_idx, pdf_image_dir, image_format, dpi
+            # Only submit if the *next* page is within loop_end and has a valid 3-page window
+            if next_composite_page_num <= loop_end and p_after_next <= num_pdf_pages:
+                logger.debug(f"Checking/Submitting next composite task for page {next_composite_page_num}")
+                # Ensure required page images (p_curr_next, p_next_next, p_after_next) exist
+                paths_next = [ensure_page_image_exists(p) for p in [p_curr_next, p_next_next, p_after_next]]
+                if all(paths_next):
+                    base_name_next = f"page_{next_composite_page_num:04d}"
+                    next_composite_future = executor.submit(
+                        create_composite_image_task, paths_next, temp_composite_dir, base_name_next
                     )
-                    if generated_path:
-                        current_images_on_disk.add(generated_path)
-                        montage_input_paths.append(generated_path)
-                    else:
-                        logger.error(f"Failed to generate required image for page {page_idx} ({role}). Skipping transcription for page {p_curr}.")
-                        generation_failed = True
-                        break # Stop trying to generate for this window
-                elif img_path.exists(): # Already exists (or just generated by another role check)
-                     if img_path not in current_images_on_disk: # Track if untracked
-                        current_images_on_disk.add(img_path)
-                     montage_input_paths.append(img_path)
-                else: # Should not happen if logic is correct
-                     logger.error(f"Logic error: Image path {img_path.name} not in set and does not exist.")
-                     generation_failed = True
-                     break
+                    logger.info(f"Submitted composite task for next page {next_composite_page_num}")
+                else:
+                    logger.warning(f"Could not generate necessary page images for next composite ({next_composite_page_num}). Next future not submitted.")
+                    next_composite_future = None # Explicitly set to None
+            else:
+                logger.debug(f"Not submitting next composite task: page {next_composite_page_num} is near end or out of bounds.")
+                next_composite_future = None # We've reached the end
 
-            if generation_failed or len(montage_input_paths) != 3:
-                logger.warning(f"Skipping transcription for page {p_curr} due to missing required images.")
-                processing_successful = False # Mark failure for this PDF
-                # Clean up page - 2 if possible
-                delete_page_image(page_num - 2)
-                continue # Try next page number
-
-            # --- Create Composite and Transcribe ---
-            middle_page_name = required_paths["curr"].name
-            files_processed_count += 1
-            base_name = f"page_{page_num:04d}" # Composite name base
-            temp_composite_img_path = None
-
-            try:
-                temp_composite_img_path = create_temporary_composite_image(
-                    montage_input_paths, temp_composite_dir, base_name
-                )
-
-                if temp_composite_img_path and temp_composite_img_path.exists():
-                    transcription = None
+            # --- Wait for and Process CURRENT composite ---
+            # Can we transcribe the current page_num? Check window validity.
+            if p_prev < 1 or p_next > num_pdf_pages:
+                logger.info(f"Skipping transcription for edge page {page_num}: Cannot form 3-page window.")
+                if state_file_path: # Update state even for skipped edge
+                     pdf_state["last_processed"] = page_num
+                     state_data[pdf_filename] = pdf_state
+                     save_resume_state(state_file_path, state_data)
+                # No composite future to wait for here
+                current_composite_future = None # Clear current future as it wasn't needed/generated
+            else:
+                # --- Wait for the composite needed for THIS page_num ---
+                if current_composite_future:
+                    logger.debug(f"Waiting for composite result for page {page_num}...")
+                    temp_composite_img_path = None
+                    composite_exception = None
                     try:
-                        transcription = transcribe_image(
-                            toolkit=image_toolkit,
-                            image_path=temp_composite_img_path,
-                            original_middle_page_name=middle_page_name,
-                            previous_transcription=last_successful_transcription,
-                            prompt_template=prompt_template
-                        )
+                        temp_composite_img_path = current_composite_future.result(timeout=600) # Wait up to 10 mins for montage
+                    except concurrent.futures.TimeoutError:
+                        logger.error(f"Timeout waiting for composite generation future for page {page_num}.")
+                        composite_exception = TimeoutError("Composite generation timed out")
+                    except Exception as e_future:
+                        logger.error(f"Composite generation failed for page {page_num}: {e_future}")
+                        composite_exception = e_future # Store exception
 
-                        if transcription:
-                            transcription = transcription.strip() # Already cleaned in transcribe_image
-                            if transcription.upper() == "SKIPPED":
-                                logger.info(f"SKIPPED page {page_num} ({middle_page_name}) due to ancillary content.")
-                                # --- Update State for SKIPPED page ---
-                                if state_file_path:
-                                    pdf_state["last_processed"] = page_num # Update specific dict
-                                    state_data[pdf_filename] = pdf_state # Put updated dict back
-                                    save_resume_state(state_file_path, state_data) # Save entire state
-                                    logger.debug(f"Updated resume state after skipping page {page_num}")
-                                # DO NOT update last_successful_transcription for skipped pages
-                            else:
-                                if output_path:
-                                    try:
-                                        with open(output_path, 'a', encoding='utf-8') as f:
-                                            f.write(transcription + "\n\n") # Add spacing
-                                        logger.info(f"Appended transcription for page {page_num} to {output_path.name}")
+                    if temp_composite_img_path and temp_composite_img_path.exists():
+                        logger.info(f"Composite ready for page {page_num}: {temp_composite_img_path.name}")
+                        files_processed_count += 1
+                        middle_page_name = get_image_path(p_curr).name
+                        transcription = None
+                        try:
+                            # --- Transcribe using the completed composite ---
+                            transcription = transcribe_image(
+                                toolkit=image_toolkit,
+                                image_path=temp_composite_img_path,
+                                original_middle_page_name=middle_page_name,
+                                previous_transcription=last_successful_transcription,
+                                prompt_template=prompt_template
+                            )
 
-                                        # --- Update State AFTER successful write ---
+                            if transcription:
+                                transcription = transcription.strip()
+                                if transcription.upper() == "SKIPPED":
+                                    logger.info(f"SKIPPED page {page_num} ({middle_page_name}) due to ancillary content.")
+                                    if state_file_path:
+                                        pdf_state["last_processed"] = page_num
+                                        state_data[pdf_filename] = pdf_state
+                                        save_resume_state(state_file_path, state_data)
+                                else:
+                                    if output_path:
+                                        try:
+                                            with open(output_path, 'a', encoding='utf-8') as f:
+                                                f.write(transcription + "\n\n")
+                                            logger.info(f"Appended transcription for page {page_num} to {output_path.name}")
+                                            if state_file_path:
+                                                pdf_state["last_processed"] = page_num
+                                                state_data[pdf_filename] = pdf_state
+                                                save_resume_state(state_file_path, state_data)
+                                        except IOError as e:
+                                            logger.error(f"Error writing transcription for page {page_num} to {output_path}: {e}")
+                                            processing_successful = False
+                                    else: # Output to console
+                                        print(f"--- Transcription for Page {page_num} ({middle_page_name}) ---")
+                                        print(transcription)
+                                        print("--- End Transcription ---\n")
                                         if state_file_path:
                                             pdf_state["last_processed"] = page_num
                                             state_data[pdf_filename] = pdf_state
                                             save_resume_state(state_file_path, state_data)
-                                            logger.debug(f"Updated resume state for {pdf_filename} to page {page_num}")
 
-                                    except IOError as e:
-                                        logger.error(f"Error writing transcription for page {page_num} to {output_path}: {e}")
-                                        processing_successful = False
-                                        # Don't update state if write fails
-                                else: # Output to console
-                                    print(f"--- Transcription for Page {page_num} ({middle_page_name}) ---")
-                                    print(transcription)
-                                    print("--- End Transcription ---\n")
-                                    # Also update state if writing to console was implicitly successful
-                                    if state_file_path:
-                                            pdf_state["last_processed"] = page_num
-                                            state_data[pdf_filename] = pdf_state
-                                            save_resume_state(state_file_path, state_data)
-                                            logger.debug(f"Updated resume state for {pdf_filename} to page {page_num} (console output)")
+                                    last_successful_transcription = transcription # Update context
+                            else:
+                                logger.warning(f"--- Transcription FAILED for page {page_num} ({middle_page_name}) ---")
+                                processing_successful = False
 
+                        except Exception as e_transcribe:
+                             logger.error(f"Error during transcription/writing for page {page_num} ({middle_page_name}): {e_transcribe}", exc_info=True)
+                             processing_successful = False
+                        finally:
+                            # --- Delete the USED composite image ---
+                            if temp_composite_img_path and temp_composite_img_path.exists():
+                                try: temp_composite_img_path.unlink(); logger.debug(f"Deleted used composite: {temp_composite_img_path.name}")
+                                except OSError as e_del_comp: logger.warning(f"Could not delete used composite {temp_composite_img_path.name}: {e_del_comp}")
 
-                                # Update context ONLY if transcription was successful AND NOT skipped
-                                last_successful_transcription = transcription
-                        else:
-                            logger.warning(f"--- Transcription FAILED (empty/failed result) for page {page_num} ({middle_page_name}) ---")
-                            processing_successful = False
-                            # Do not update state if transcription fails
-
-                    except Exception as e_transcribe:
-                         logger.error(f"Error during transcription/writing for page {page_num} ({middle_page_name}): {e_transcribe}", exc_info=True)
+                    elif composite_exception:
+                         logger.error(f"Skipping transcription for page {page_num} because composite generation failed: {composite_exception}")
+                         processing_successful = False
+                    else: # Future completed but returned None or file doesn't exist
+                         logger.error(f"Composite generation future completed for page {page_num}, but path is invalid or file missing. Skipping transcription.")
                          processing_successful = False
                 else:
-                    logger.error(f"Failed to create composite image for page {page_num} ({middle_page_name}). Skipping.")
-                    processing_successful = False
+                    # This case might happen if the first page was skipped or pre-gen failed
+                    logger.warning(f"No current composite future available to wait for page {page_num}. Skipping transcription.")
+                    # Don't mark as failure unless pre-gen explicitly failed earlier
 
-            except Exception as e_outer:
-                logger.error(f"Outer loop error for page {page_num} ({middle_page_name}): {e_outer}", exc_info=True)
-                processing_successful = False
-            finally:
-                if temp_composite_img_path and temp_composite_img_path.exists():
-                    try:
-                        temp_composite_img_path.unlink()
-                        logger.debug(f"Deleted temporary composite: {temp_composite_img_path.name}")
-                    except OSError as e_del_comp:
-                        logger.warning(f"Could not delete temporary composite {temp_composite_img_path.name}: {e_del_comp}")
+            # --- Advance the future ---
+            # The future generated for page_num+1 becomes the 'current' future for the next iteration
+            current_composite_future = next_composite_future
 
-            # --- Rolling Cleanup: Delete oldest image (page_num - 2) ---
+            # --- Rolling Cleanup: Delete oldest page image (page_num - 2) ---
             delete_page_image(page_num - 2)
-
-            # Check if overall processing failed to break early
-            if not processing_successful:
-                 logger.error(f"Stopping processing for {pdf_filename} due to error.")
-                 break # Exit the loop for this PDF
 
     finally:
         # --- Final Cleanup for this PDF ---
         logger.debug(f"Performing final image cleanup for {pdf_filename}...")
-        # Create a copy of the set to iterate over, as we modify it inside loop
         images_to_delete = list(current_images_on_disk)
         for img_path in images_to_delete:
-            # Extract page num from name to call delete helper correctly
-            match = re.search(r"-(\d+)\.[^.]+$", img_path.name)
-            if match:
+             match = re.search(r"-(\d+)\.[^.]+$", img_path.name)
+             if match:
+                 try: delete_page_image(int(match.group(1)))
+                 except ValueError: logger.warning(f"Could not parse page num from {img_path.name} for final cleanup.")
+                 except Exception as e_final_del_helper: logger.warning(f"Error in final cleanup helper for {img_path.name}: {e_final_del_helper}")
+             else: # Direct delete try
                  try:
-                     pn = int(match.group(1))
-                     delete_page_image(pn)
-                 except ValueError:
-                      logger.warning(f"Could not parse page number from {img_path.name} for final cleanup.")
-                 except Exception as e_final_del_helper:
-                      logger.warning(f"Error in final cleanup helper for {img_path.name}: {e_final_del_helper}")
-            else:
-                 # If name doesn't match, just try to delete the file directly
-                 try:
-                      if img_path.exists():
-                           img_path.unlink()
-                           logger.debug(f"Deleted non-standard named image in final cleanup: {img_path.name}")
-                 except OSError as e_final_del_direct:
-                      logger.warning(f"Could not delete non-standard image in final cleanup {img_path.name}: {e_final_del_direct}")
-
+                      if img_path.exists(): img_path.unlink(); logger.debug(f"Deleted non-standard named image in final cleanup: {img_path.name}")
+                 except OSError as e_final_del_direct: logger.warning(f"Could not delete non-standard image in final cleanup {img_path.name}: {e_final_del_direct}")
 
         # Clean up composite directory
         if temp_composite_dir.exists():
@@ -842,6 +835,7 @@ def process_pdf_pages(
 
     logger.info(f"Finished loop for PDF {pdf_filename}. Processed {files_processed_count} pages within effective range.")
     return processing_successful, last_successful_transcription
+
 
 # --- Model Parsing and Platform Inference (Unchanged) ---
 def parse_model_string_to_enum(model_string: str, model_purpose: str) -> Optional[Union[ModelType, str]]:
@@ -1162,7 +1156,6 @@ def get_pdf_page_count(pdf_path: Path) -> Optional[int]:
         return None
 
 # --- Main Logic Function ---
-# --- MODIFIED: run_main_logic incorporates persistent page range ---
 def run_main_logic(args):
     # Set up logging based on args
     log_level_int = getattr(logging, args.log_level.upper(), logging.INFO)
@@ -1227,7 +1220,8 @@ def run_main_logic(args):
         # --- Add warning for image mode ---
         logger.warning("Processing in image directory mode. Assumes images are pre-generated.")
         logger.warning("The 'rolling window' optimization only applies when processing PDFs directly (--book-dir mode).")
-        logger.warning("Persistent page range detection/storage is not applicable in image directory mode.") # Added warning
+        logger.warning("Asynchronous composite generation is not applicable in image directory mode.") # Added warning
+        logger.warning("Persistent page range detection/storage is not applicable in image directory mode.")
 
     else: # PDF Mode
         if args.output:
@@ -1237,7 +1231,6 @@ def run_main_logic(args):
         try:
             output_directory_path.mkdir(parents=True, exist_ok=True)
             logger.info(f"Output directory for books: {output_directory_path}")
-            # --- MODIFIED: State file path defined here ---
             resume_state_file_path = output_directory_path / RESUME_STATE_FILENAME
             logger.info(f"Resume state will be managed in: {resume_state_file_path}")
         except OSError as e:
@@ -1323,10 +1316,10 @@ def run_main_logic(args):
 
     # --- Main Processing Logic ---
     if not process_pdfs:
-        # --- Single Image Directory Processing (Handles pre-generated images) ---
-        # (This section remains largely unchanged as state/range persistence doesn't apply)
+        # --- Single Image Directory Processing (Remains Sequential) ---
         logger.info(f"Processing pre-existing images directly from: {source_dir}")
-        # --- Load context if appending ---
+        # (Keep the existing logic for image directory mode here as async doesn't apply well)
+        # ... [Existing image directory processing logic - unchanged] ...
         overall_initial_context: Optional[str] = None
         if single_output_file_path and final_append_mode:
             if single_output_file_path.exists() and single_output_file_path.stat().st_size > 0:
@@ -1338,7 +1331,6 @@ def run_main_logic(args):
                         if overall_initial_context: logger.info(f"Loaded context (last ~{len(overall_initial_context)} chars) from single file.")
                 except Exception as e: logger.error(f"Error reading context from {single_output_file_path}: {e}")
             else: logger.info(f"Append mode active, but output file {single_output_file_path} missing/empty. Starting fresh.")
-            # Add separator
             try:
                  if single_output_file_path.exists():
                      with open(single_output_file_path, 'a', encoding='utf-8') as f:
@@ -1346,37 +1338,27 @@ def run_main_logic(args):
                          f.write(separator)
             except IOError as e: logger.error(f"Error adding append separator to {single_output_file_path}: {e}")
 
-        # Find and sort existing images using their extracted numbers
         image_files_with_nums = []
         supported_extensions = ["*.jpg", "*.jpeg", "*.png", "*.ppm"]
         for ext in supported_extensions:
             for file_path in source_dir.glob(ext):
                 page_num = extract_page_number(file_path)
-                if page_num is not None:
-                    image_files_with_nums.append((page_num, file_path))
-                else:
-                    logger.debug(f"Skipping file due to non-standard name format or failed number extraction: {file_path.name}")
+                if page_num is not None: image_files_with_nums.append((page_num, file_path))
+                else: logger.debug(f"Skipping file due to non-standard name format or failed number extraction: {file_path.name}")
 
-        if not image_files_with_nums:
-            logger.warning(f"No image files with extractable page numbers found in {source_dir}. Exiting.")
-            sys.exit(0)
-
+        if not image_files_with_nums: logger.warning(f"No image files with extractable page numbers found in {source_dir}. Exiting."); sys.exit(0)
         image_files_with_nums.sort(key=lambda x: x[0])
-        image_files = [item[1] for item in image_files_with_nums] # Sorted list of Paths
+        image_files = [item[1] for item in image_files_with_nums]
         logger.info(f"Found {len(image_files)} valid images to process in {source_dir.name}.")
 
         files_processed_count = 0
         last_successful_transcription = overall_initial_context
         processing_successful = True
-        temp_composite_dir = source_dir / ".composites_img_mode" # Separate composite dir
+        temp_composite_dir = source_dir / ".composites_img_mode"
 
-        try:
-            temp_composite_dir.mkdir(exist_ok=True)
-        except OSError as e_comp_dir:
-            logger.error(f"Could not create composite dir {temp_composite_dir}: {e_comp_dir}. Cannot proceed.")
-            sys.exit(1)
+        try: temp_composite_dir.mkdir(exist_ok=True)
+        except OSError as e_comp_dir: logger.error(f"Could not create composite dir {temp_composite_dir}: {e_comp_dir}. Cannot proceed."); sys.exit(1)
 
-        # Prepare output file
         if single_output_file_path and not final_append_mode:
              try:
                  single_output_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1384,366 +1366,220 @@ def run_main_logic(args):
                  logger.info(f"Output file {single_output_file_path} truncated (or created).")
              except IOError as e: logger.error(f"Error preparing output file {single_output_file_path}: {e}"); sys.exit(1)
 
-        # Loop through EXISTING images
         for i, current_image_path in enumerate(image_files):
              middle_page_name = current_image_path.name
-             # Extract page number *again* for range check (already extracted for sorting)
              page_num = extract_page_number(current_image_path)
-             if page_num is None:
-                 logger.warning(f"Could not extract page number from image {middle_page_name} during processing loop, skipping.")
-                 continue
-
-             # Apply user range if provided
-             if user_start_page_arg is not None and page_num < user_start_page_arg:
-                  logger.debug(f"Skipping image {middle_page_name} (page {page_num}): before user start {user_start_page_arg}.")
-                  continue
-             if user_end_page_arg is not None and page_num > user_end_page_arg:
-                  logger.info(f"Reached user end page {user_end_page_arg}. Stopping image processing.")
-                  break
-
-             # Check for 3-image window (using indices)
+             if page_num is None: logger.warning(f"Could not extract page number from image {middle_page_name} during processing loop, skipping."); continue
+             if user_start_page_arg is not None and page_num < user_start_page_arg: logger.debug(f"Skipping image {middle_page_name} (page {page_num}): before user start {user_start_page_arg}."); continue
+             if user_end_page_arg is not None and page_num > user_end_page_arg: logger.info(f"Reached user end page {user_end_page_arg}. Stopping image processing."); break
              can_get_prev = i > 0
              can_get_next = i < len(image_files) - 1
-             if not can_get_prev or not can_get_next:
-                  logger.info(f"Skipping edge image {middle_page_name}: Cannot form 3-page set.")
-                  continue
+             if not can_get_prev or not can_get_next: logger.info(f"Skipping edge image {middle_page_name}: Cannot form 3-page set."); continue
 
              logger.info(f"Processing image {middle_page_name} (Page: {page_num}, Index: {i})")
              files_processed_count += 1
-
-             # Create composite from EXISTING images
              montage_input_paths = [image_files[i-1], image_files[i], image_files[i+1]]
-             base_name = f"img_page_{page_num:04d}" # Use page num for composite name base
+             base_name = f"img_page_{page_num:04d}"
              temp_composite_img_path = None
 
              try:
-                  temp_composite_img_path = create_temporary_composite_image(
-                      montage_input_paths, temp_composite_dir, base_name
-                  )
+                  # --- MODIFIED: Use create_composite_image_task directly (no async needed here) ---
+                  temp_composite_img_path = create_composite_image_task(montage_input_paths, temp_composite_dir, base_name)
 
                   if temp_composite_img_path and temp_composite_img_path.exists():
                       transcription = None
                       try:
-                          # Transcribe
                           transcription = transcribe_image(
-                              toolkit=transcription_toolkit,
-                              image_path=temp_composite_img_path,
-                              original_middle_page_name=middle_page_name,
-                              previous_transcription=last_successful_transcription,
+                              toolkit=transcription_toolkit, image_path=temp_composite_img_path,
+                              original_middle_page_name=middle_page_name, previous_transcription=last_successful_transcription,
                               prompt_template=PROMPT_TEMPLATE
                           )
-
                           if transcription:
                               transcription = transcription.strip()
-                              if transcription.upper() == "SKIPPED":
-                                  logger.info(f"SKIPPED image {middle_page_name} due to ancillary content.")
+                              if transcription.upper() == "SKIPPED": logger.info(f"SKIPPED image {middle_page_name} due to ancillary content.")
                               else:
-                                  # Write output
                                   if single_output_file_path:
                                       try:
-                                          with open(single_output_file_path, 'a', encoding='utf-8') as f:
-                                              f.write(transcription + "\n\n")
+                                          with open(single_output_file_path, 'a', encoding='utf-8') as f: f.write(transcription + "\n\n")
                                           logger.info(f"Appended transcription for image {middle_page_name} to {single_output_file_path.name}")
-                                      except IOError as e:
-                                          logger.error(f"Error writing transcription for {middle_page_name} to {single_output_file_path}: {e}")
-                                          processing_successful = False
-                                  else: # Output to console
-                                      print(f"--- Transcription for Image {middle_page_name} ---")
-                                      print(transcription)
-                                      print("--- End Transcription ---\n")
-
-                                  # Update context ONLY if successful AND NOT skipped
+                                      except IOError as e: logger.error(f"Error writing transcription for {middle_page_name} to {single_output_file_path}: {e}"); processing_successful = False
+                                  else: print(f"--- Transcription for Image {middle_page_name} ---\n{transcription}\n--- End Transcription ---\n")
                                   last_successful_transcription = transcription
-                          else:
-                              logger.warning(f"--- Transcription FAILED for image {middle_page_name} ---")
-                              processing_successful = False
-
-                      except Exception as e_transcribe:
-                           logger.error(f"Error during transcription/writing for image {middle_page_name}: {e_transcribe}", exc_info=True)
-                           processing_successful = False
-                  else:
-                      logger.error(f"Failed to create composite image for {middle_page_name}. Skipping.")
-                      processing_successful = False
-
-             except Exception as e_outer:
-                  logger.error(f"Outer loop error for image {middle_page_name}: {e_outer}", exc_info=True)
-                  processing_successful = False
+                          else: logger.warning(f"--- Transcription FAILED for image {middle_page_name} ---"); processing_successful = False
+                      except Exception as e_transcribe: logger.error(f"Error during transcription/writing for image {middle_page_name}: {e_transcribe}", exc_info=True); processing_successful = False
+                  else: logger.error(f"Failed to create composite image for {middle_page_name}. Skipping."); processing_successful = False
+             except Exception as e_outer: logger.error(f"Outer loop error for image {middle_page_name}: {e_outer}", exc_info=True); processing_successful = False
              finally:
                   if temp_composite_img_path and temp_composite_img_path.exists():
-                      try:
-                          temp_composite_img_path.unlink()
-                          logger.debug(f"Deleted temporary composite: {temp_composite_img_path.name}")
-                      except OSError as e_del_comp:
-                          logger.warning(f"Could not delete temporary composite {temp_composite_img_path.name}: {e_del_comp}")
+                      try: temp_composite_img_path.unlink(); logger.debug(f"Deleted temporary composite: {temp_composite_img_path.name}")
+                      except OSError as e_del_comp: logger.warning(f"Could not delete temporary composite {temp_composite_img_path.name}: {e_del_comp}")
 
-             # No rolling delete needed in this mode
-
-        # Cleanup composite dir for image mode
         if temp_composite_dir.exists():
              try: shutil.rmtree(temp_composite_dir)
              except OSError as e_final_clean: logger.warning(f"Could not clean up composites directory {temp_composite_dir}: {e_final_clean}")
-
-        if not processing_successful:
-             logger.error(f"Processing encountered errors for image directory: {source_dir}")
+        if not processing_successful: logger.error(f"Processing encountered errors for image directory: {source_dir}")
         logger.info("Image directory processing finished.")
 
     else:
-        # --- PDF Directory Processing with Rolling Window ---
+        # --- PDF Directory Processing with Async Composite Generation ---
         pdf_files = sorted(list(source_dir.glob('*.pdf')))
         if not pdf_files:
             logger.warning(f"No PDF files found in book directory: {source_dir}")
             sys.exit(0)
 
         logger.info(f"Found {len(pdf_files)} PDFs to process.")
-        # --- MODIFIED: Load state file ---
         current_state_data = load_resume_state(resume_state_file_path) if resume_state_file_path else {}
-        images_base_dir = source_dir / TEMP_IMAGE_SUBDIR # Parent dir for all PDF temp images
+        images_base_dir = source_dir / TEMP_IMAGE_SUBDIR
 
-        for pdf_path in pdf_files:
-            pdf_filename = pdf_path.name
-            logger.info(f"--- Starting processing for PDF: {pdf_filename} ---")
-            book_specific_output_path = output_directory_path / f"{pdf_path.stem}.txt"
-            pdf_image_dir_path = images_base_dir / pdf_path.stem # Specific subdir for this PDF's images
+        # --- Create ThreadPoolExecutor ---
+        # max_workers=1 is enough, we only need one background task for the next composite
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='CompositeGen') as executor:
+            for pdf_path in pdf_files:
+                pdf_filename = pdf_path.name
+                logger.info(f"--- Starting processing for PDF: {pdf_filename} ---")
+                book_specific_output_path = output_directory_path / f"{pdf_path.stem}.txt"
+                pdf_image_dir_path = images_base_dir / pdf_path.stem
 
-            logger.info(f"Output for '{pdf_filename}' will be: {book_specific_output_path}")
-            logger.info(f"Temporary images for '{pdf_filename}' will be in: {pdf_image_dir_path}")
+                logger.info(f"Output for '{pdf_filename}' will be: {book_specific_output_path}")
+                logger.info(f"Temporary images for '{pdf_filename}' will be in: {pdf_image_dir_path}")
 
-            if check_if_file_completed(book_specific_output_path, END_MARKER):
-                logger.info(f"'{pdf_filename}' already marked as completed ('{END_MARKER}' found). Skipping.")
-                # --- MODIFIED: Remove completed book from state if present ---
-                if resume_state_file_path and pdf_filename in current_state_data:
-                    logger.info(f"Removing completed book '{pdf_filename}' from resume state.")
-                    del current_state_data[pdf_filename]
-                    save_resume_state(resume_state_file_path, current_state_data)
-                # Clean up leftover image dir if it exists and not keeping images
-                if pdf_image_dir_path.exists() and not args.keep_images:
-                    try:
-                        shutil.rmtree(pdf_image_dir_path)
-                        logger.debug(f"Cleaned up leftover image directory for completed PDF: {pdf_image_dir_path}")
-                    except OSError as e_clean_comp:
-                         logger.warning(f"Could not clean up leftover image dir {pdf_image_dir_path}: {e_clean_comp}")
-                continue
-
-            # --- Get Total Page Count ---
-            num_pdf_pages = get_pdf_page_count(pdf_path)
-            if num_pdf_pages is None:
-                logger.error(f"Could not determine page count for '{pdf_filename}'. Skipping this PDF.")
-                continue
-
-            # --- Determine Base Page Range (User Args OR State OR Auto-Detect) ---
-            base_start_page = None
-            base_end_page = None
-            range_source = "undetermined"
-            analysis_performed_this_run = False # Flag to avoid saving state unnecessarily
-
-            # --- Get the specific state for this PDF ---
-            pdf_state = current_state_data.get(pdf_filename, {})
-
-            # Priority 1: User Arguments
-            if user_start_page_arg is not None and user_end_page_arg is not None:
-                base_start_page = user_start_page_arg
-                base_end_page = user_end_page_arg
-                range_source = "user"
-                logger.info(f"Using user-provided page range for '{pdf_filename}': {base_start_page}-{base_end_page}")
-                # User override: Clear any detected range in state if it exists
-                if "detected_start" in pdf_state or "detected_end" in pdf_state:
-                    logger.debug(f"Clearing previously detected range from state for '{pdf_filename}' due to user override.")
-                    pdf_state.pop("detected_start", None)
-                    pdf_state.pop("detected_end", None)
-                    # Save state immediately if changes were made
-                    if resume_state_file_path:
-                        current_state_data[pdf_filename] = pdf_state
+                if check_if_file_completed(book_specific_output_path, END_MARKER):
+                    logger.info(f"'{pdf_filename}' already marked as completed ('{END_MARKER}' found). Skipping.")
+                    if resume_state_file_path and pdf_filename in current_state_data:
+                        logger.info(f"Removing completed book '{pdf_filename}' from resume state.")
+                        del current_state_data[pdf_filename]
                         save_resume_state(resume_state_file_path, current_state_data)
-
-
-            # Priority 2: Load from State
-            elif "detected_start" in pdf_state or "detected_end" in pdf_state:
-                 # Check if *both* are present and potentially valid (allow None)
-                 loaded_start = pdf_state.get("detected_start")
-                 loaded_end = pdf_state.get("detected_end")
-                 # Basic validation: check if they are ints or None
-                 if (isinstance(loaded_start, int) or loaded_start is None) and \
-                    (isinstance(loaded_end, int) or loaded_end is None):
-                      base_start_page = loaded_start
-                      base_end_page = loaded_end
-                      range_source = "state"
-                      logger.info(f"Using page range from state file for '{pdf_filename}': Start={base_start_page}, End={base_end_page}")
-                 else:
-                      logger.warning(f"Invalid page range data found in state for '{pdf_filename}': Start={loaded_start}, End={loaded_end}. Will attempt auto-detection.")
-                      # Clear invalid state entries
-                      pdf_state.pop("detected_start", None)
-                      pdf_state.pop("detected_end", None)
-                      range_source = "state_invalid" # Fall through to analysis
-
-            # Priority 3: Auto-Detect (if user args not given AND not found/invalid in state)
-            if range_source in ["undetermined", "state_invalid"]:
-                logger.info(f"No valid page range from user or state for '{pdf_filename}'. Attempting automatic detection...")
-                range_source = "auto"
-                toc_text = extract_toc(pdf_path)
-                if toc_text and analysis_model_backend:
-                    detected_start, detected_end = get_main_content_page_range(
-                        toc_text, analysis_model_backend
-                    )
-                    analysis_performed_this_run = True # Analysis was attempted
-                    if detected_start is not None or detected_end is not None:
-                         logger.info(f"Auto-detected range for '{pdf_filename}': Start={detected_start}, End={detected_end}")
-                         base_start_page = detected_start # Can be None
-                         base_end_page = detected_end   # Can be None
-                         # --- MODIFIED: Store detected range in state ---
-                         pdf_state["detected_start"] = base_start_page
-                         pdf_state["detected_end"] = base_end_page
-                    else:
-                         logger.warning(f"Automatic page range detection failed for '{pdf_filename}'. Processing all pages (subject to resume).")
-                         range_source = "failed_auto"
-                         # --- MODIFIED: Store failure (null) in state ---
-                         pdf_state["detected_start"] = None
-                         pdf_state["detected_end"] = None
-                else:
-                     logger.warning(f"Could not extract TOC or analysis model not available for '{pdf_filename}'. Processing all pages (subject to resume).")
-                     range_source = "no_toc"
-                     analysis_performed_this_run = True # Attempted but failed due to missing prereq
-                     # --- MODIFIED: Store failure (null) in state ---
-                     pdf_state["detected_start"] = None
-                     pdf_state["detected_end"] = None
-
-                # --- MODIFIED: Save state immediately after analysis attempt ---
-                if analysis_performed_this_run and resume_state_file_path:
-                    current_state_data[pdf_filename] = pdf_state # Ensure pdf_state is in main dict
-                    save_resume_state(resume_state_file_path, current_state_data)
-                    logger.info(f"Saved analysis result (or failure) to state file for '{pdf_filename}'.")
-
-
-            # --- Determine Effective Page Range & Resumption ---
-            last_processed_page = pdf_state.get("last_processed") # Get from specific PDF state
-            resuming = last_processed_page is not None
-            resume_start_page = (last_processed_page + 1) if resuming else 1
-
-            logger.debug(f"Range Source: {range_source}. Base range: {base_start_page}-{base_end_page}. Resume state: last_processed={last_processed_page}")
-
-            # Calculate final effective start page
-            effective_start_page = base_start_page # Start with base (can be None)
-            if resuming:
-                 # Ensure resume starts *at or after* the base start page
-                 effective_start_page = max(resume_start_page, base_start_page or 1)
-            elif base_start_page is None:
-                 effective_start_page = 1 # If no base, start at 1
-
-            # Effective end is the base end, capped by total pages
-            effective_end_page = base_end_page if base_end_page is not None else num_pdf_pages
-            effective_end_page = min(effective_end_page, num_pdf_pages)
-
-            logger.info(f"Effective processing range for '{pdf_filename}': Start={effective_start_page}, End={effective_end_page}")
-
-            if effective_start_page > effective_end_page:
-                 logger.warning(f"Effective start page {effective_start_page} is after effective end page {effective_end_page} for '{pdf_filename}'. Nothing to process.")
-                 # Check if this is because we resumed *after* the end page
-                 if resuming and last_processed_page >= effective_end_page:
-                     logger.info(f"PDF '{pdf_filename}' already processed up to or beyond effective end page based on resume state.")
-                     # Consider marking as complete here? For now, just skip.
-                 continue
-
-            # --- Load Context for Append/Resume ---
-            current_book_initial_context = None
-            load_context_needed = resuming or final_append_mode
-            if load_context_needed and book_specific_output_path.exists() and book_specific_output_path.stat().st_size > 0:
-                try:
-                    logger.info(f"Reading context from existing file: {book_specific_output_path} (Reason: {'resume' if resuming else 'append'})")
-                    with open(book_specific_output_path, 'r', encoding='utf-8') as bf:
-                        read_size = 4096
-                        bf.seek(max(0, book_specific_output_path.stat().st_size - read_size))
-                        current_book_initial_context = bf.read().strip() or None
-                        if current_book_initial_context: logger.info(f"Loaded context for book {pdf_filename}. Length: {len(current_book_initial_context)}")
-                        else: logger.warning(f"Could not read context from existing file: {book_specific_output_path}")
-                except Exception as e: logger.error(f"Error reading context for {book_specific_output_path}: {e}")
-            elif load_context_needed:
-                 logger.info(f"Append/Resume mode active, but file {book_specific_output_path} missing/empty. Starting context fresh.")
-
-            # Add append separator if explicitly appending and file exists
-            if final_append_mode and book_specific_output_path.exists() and book_specific_output_path.stat().st_size > 0 and not resuming: # Only add separator if NOT resuming
-                 try:
-                     with open(book_specific_output_path, 'a', encoding='utf-8') as bf:
-                         separator = f"\n\n{'='*20} Appending ({range_source}) at {datetime.datetime.now()} {'='*20}\n\n"
-                         bf.write(separator)
-                 except IOError as e:
-                    logger.error(f"Error preparing file {book_specific_output_path} for appending: {e}. Skipping book.")
+                    if pdf_image_dir_path.exists() and not args.keep_images:
+                        try: shutil.rmtree(pdf_image_dir_path); logger.debug(f"Cleaned up leftover image directory for completed PDF: {pdf_image_dir_path}")
+                        except OSError as e_clean_comp: logger.warning(f"Could not clean up leftover image dir {pdf_image_dir_path}: {e_clean_comp}")
                     continue
 
-            # --- Process the PDF using Rolling Window ---
-            pdf_processing_success = False
-            try:
-                # Ensure image directory exists (might have been cleaned if completed before)
-                pdf_image_dir_path.mkdir(parents=True, exist_ok=True) # <<< ENSURE DIR EXISTS >>>
+                num_pdf_pages = get_pdf_page_count(pdf_path)
+                if num_pdf_pages is None: logger.error(f"Could not determine page count for '{pdf_filename}'. Skipping."); continue
 
-                # Determine the actual mode for process_pdf_pages's append logic
-                process_append_mode = resuming or final_append_mode
+                # --- Determine Base Page Range Logic (remains the same) ---
+                base_start_page, base_end_page = None, None
+                range_source = "undetermined"
+                analysis_performed_this_run = False
+                pdf_state = current_state_data.get(pdf_filename, {})
 
-                # <<< REMOVED BULK CONVERSION CALL >>>
+                if user_start_page_arg is not None and user_end_page_arg is not None:
+                    base_start_page, base_end_page = user_start_page_arg, user_end_page_arg
+                    range_source = "user"
+                    logger.info(f"Using user-provided page range for '{pdf_filename}': {base_start_page}-{base_end_page}")
+                    if "detected_start" in pdf_state or "detected_end" in pdf_state:
+                        logger.debug(f"Clearing previously detected range from state for '{pdf_filename}' due to user override.")
+                        pdf_state.pop("detected_start", None); pdf_state.pop("detected_end", None)
+                        if resume_state_file_path: current_state_data[pdf_filename] = pdf_state; save_resume_state(resume_state_file_path, current_state_data)
+                elif "detected_start" in pdf_state or "detected_end" in pdf_state:
+                     loaded_start, loaded_end = pdf_state.get("detected_start"), pdf_state.get("detected_end")
+                     if (isinstance(loaded_start, int) or loaded_start is None) and (isinstance(loaded_end, int) or loaded_end is None):
+                          base_start_page, base_end_page = loaded_start, loaded_end
+                          range_source = "state"
+                          logger.info(f"Using page range from state file for '{pdf_filename}': Start={base_start_page}, End={base_end_page}")
+                     else:
+                          logger.warning(f"Invalid page range data in state for '{pdf_filename}': Start={loaded_start}, End={loaded_end}. Will attempt auto-detection.")
+                          pdf_state.pop("detected_start", None); pdf_state.pop("detected_end", None)
+                          range_source = "state_invalid"
 
-                # Call the refactored PDF page processing function
-                pdf_processing_success, _ = process_pdf_pages(
-                    pdf_path=pdf_path,
-                    num_pdf_pages=num_pdf_pages,
-                    pdf_image_dir=pdf_image_dir_path, # Pass the dedicated dir
-                    output_path=book_specific_output_path,
-                    append_mode=process_append_mode, # Use calculated append mode
-                    start_page=effective_start_page,
-                    end_page=effective_end_page,
-                    image_toolkit=transcription_toolkit,
-                    prompt_template=PROMPT_TEMPLATE,
-                    initial_context=current_book_initial_context,
-                    pdf_filename=pdf_filename,
-                    state_file_path=resume_state_file_path, # Pass state file path
-                    state_data=current_state_data, # Pass the entire state dict
-                    image_format=args.image_format, # Pass from args
-                    dpi=args.dpi # Pass from args
-                )
+                if range_source in ["undetermined", "state_invalid"]:
+                    logger.info(f"No valid page range from user or state for '{pdf_filename}'. Attempting automatic detection...")
+                    range_source = "auto"
+                    toc_text = extract_toc(pdf_path)
+                    if toc_text and analysis_model_backend:
+                        detected_start, detected_end = get_main_content_page_range(toc_text, analysis_model_backend)
+                        analysis_performed_this_run = True
+                        if detected_start is not None or detected_end is not None:
+                             logger.info(f"Auto-detected range for '{pdf_filename}': Start={detected_start}, End={detected_end}")
+                             base_start_page, base_end_page = detected_start, detected_end
+                             pdf_state["detected_start"], pdf_state["detected_end"] = base_start_page, base_end_page
+                        else: logger.warning(f"Automatic page range detection failed for '{pdf_filename}'. Processing all pages (subject to resume)."); range_source = "failed_auto"; pdf_state["detected_start"], pdf_state["detected_end"] = None, None
+                    else: logger.warning(f"Could not extract TOC or analysis model not available for '{pdf_filename}'. Processing all pages (subject to resume)."); range_source = "no_toc"; analysis_performed_this_run = True; pdf_state["detected_start"], pdf_state["detected_end"] = None, None
+                    if analysis_performed_this_run and resume_state_file_path: current_state_data[pdf_filename] = pdf_state; save_resume_state(resume_state_file_path, current_state_data); logger.info(f"Saved analysis result (or failure) to state file for '{pdf_filename}'.")
 
-                if pdf_processing_success:
-                    logger.info(f"Successfully processed PDF: {pdf_filename}")
+                # --- Determine Effective Page Range & Resumption (remains the same) ---
+                last_processed_page = pdf_state.get("last_processed")
+                resuming = last_processed_page is not None
+                resume_start_page = (last_processed_page + 1) if resuming else 1
+                logger.debug(f"Range Source: {range_source}. Base range: {base_start_page}-{base_end_page}. Resume state: last_processed={last_processed_page}")
+                effective_start_page = base_start_page
+                if resuming: effective_start_page = max(resume_start_page, base_start_page or 1)
+                elif base_start_page is None: effective_start_page = 1
+                effective_end_page = min(base_end_page if base_end_page is not None else num_pdf_pages, num_pdf_pages)
+                logger.info(f"Effective processing range for '{pdf_filename}': Start={effective_start_page}, End={effective_end_page}")
+
+                if effective_start_page > effective_end_page:
+                     logger.warning(f"Effective start page {effective_start_page} is after effective end page {effective_end_page} for '{pdf_filename}'. Nothing to process.")
+                     if resuming and last_processed_page >= effective_end_page: logger.info(f"PDF '{pdf_filename}' already processed up to or beyond effective end page based on resume state.")
+                     continue
+
+                # --- Load Context Logic (remains the same) ---
+                current_book_initial_context = None
+                load_context_needed = resuming or final_append_mode
+                if load_context_needed and book_specific_output_path.exists() and book_specific_output_path.stat().st_size > 0:
                     try:
-                        with open(book_specific_output_path, 'a', encoding='utf-8') as f_end:
-                            f_end.write(f"\n\n{END_MARKER}\n")
-                        logger.info(f"Added '{END_MARKER}' to completed file: {book_specific_output_path.name}")
-                        # --- MODIFIED: Clear state for completed book ---
-                        if resume_state_file_path and pdf_filename in current_state_data:
-                             logger.info(f"Removing completed book '{pdf_filename}' from resume state.")
-                             del current_state_data[pdf_filename]
-                             save_resume_state(resume_state_file_path, current_state_data)
+                        logger.info(f"Reading context from existing file: {book_specific_output_path} (Reason: {'resume' if resuming else 'append'})")
+                        with open(book_specific_output_path, 'r', encoding='utf-8') as bf:
+                            read_size = 4096; bf.seek(max(0, book_specific_output_path.stat().st_size - read_size))
+                            current_book_initial_context = bf.read().strip() or None
+                            if current_book_initial_context: logger.info(f"Loaded context for book {pdf_filename}. Length: {len(current_book_initial_context)}")
+                            else: logger.warning(f"Could not read context from existing file: {book_specific_output_path}")
+                    except Exception as e: logger.error(f"Error reading context for {book_specific_output_path}: {e}")
+                elif load_context_needed: logger.info(f"Append/Resume mode active, but file {book_specific_output_path} missing/empty. Starting context fresh.")
+                if final_append_mode and book_specific_output_path.exists() and book_specific_output_path.stat().st_size > 0 and not resuming:
+                     try:
+                         with open(book_specific_output_path, 'a', encoding='utf-8') as bf:
+                             separator = f"\n\n{'='*20} Appending ({range_source}) at {datetime.datetime.now()} {'='*20}\n\n"
+                             bf.write(separator)
+                     except IOError as e: logger.error(f"Error preparing file {book_specific_output_path} for appending: {e}. Skipping book."); continue
 
-                    except IOError as e:
-                         logger.error(f"Error adding '{END_MARKER}' to {book_specific_output_path.name}: {e}")
-                         pdf_processing_success = False # Mark as failed if end marker fails
-                else:
-                    logger.error(f"Processing failed for PDF: {pdf_filename}.")
+                # --- Process the PDF using Async ---
+                pdf_processing_success = False
+                try:
+                    pdf_image_dir_path.mkdir(parents=True, exist_ok=True)
+                    process_append_mode = resuming or final_append_mode
 
-            except Exception as e:
-                 logger.critical(f"Critical error processing PDF {pdf_filename}: {e}", exc_info=True)
-            finally:
-                # --- Cleanup image directory for this PDF ---
-                if pdf_image_dir_path.exists() and not args.keep_images:
-                    try:
-                        shutil.rmtree(pdf_image_dir_path)
-                        logger.info(f"Cleaned up PDF image directory: {pdf_image_dir_path}")
-                    except Exception as e_clean:
-                         logger.error(f"Error cleaning up PDF image dir {pdf_image_dir_path}: {e_clean}")
-                elif pdf_image_dir_path and args.keep_images:
-                    logger.info(f"Keeping PDF image directory due to --keep-images flag: {pdf_image_dir_path}")
+                    pdf_processing_success, _ = process_pdf_pages(
+                        pdf_path=pdf_path, num_pdf_pages=num_pdf_pages,
+                        pdf_image_dir=pdf_image_dir_path, output_path=book_specific_output_path,
+                        append_mode=process_append_mode, start_page=effective_start_page,
+                        end_page=effective_end_page, image_toolkit=transcription_toolkit,
+                        prompt_template=PROMPT_TEMPLATE, initial_context=current_book_initial_context,
+                        pdf_filename=pdf_filename, state_file_path=resume_state_file_path,
+                        state_data=current_state_data, image_format=args.image_format,
+                        dpi=args.dpi,
+                        executor=executor # <--- Pass the executor
+                    )
 
-            logger.info(f"--- Finished processing for PDF: {pdf_filename} ---")
+                    if pdf_processing_success:
+                        logger.info(f"Successfully processed PDF: {pdf_filename}")
+                        try:
+                            with open(book_specific_output_path, 'a', encoding='utf-8') as f_end: f_end.write(f"\n\n{END_MARKER}\n")
+                            logger.info(f"Added '{END_MARKER}' to completed file: {book_specific_output_path.name}")
+                            if resume_state_file_path and pdf_filename in current_state_data:
+                                 logger.info(f"Removing completed book '{pdf_filename}' from resume state.")
+                                 del current_state_data[pdf_filename]
+                                 save_resume_state(resume_state_file_path, current_state_data)
+                        except IOError as e: logger.error(f"Error adding '{END_MARKER}' to {book_specific_output_path.name}: {e}"); pdf_processing_success = False
+                    else: logger.error(f"Processing failed for PDF: {pdf_filename}.")
 
-        # --- Final cleanup of the main temp image subdir ---
+                except Exception as e:
+                     logger.critical(f"Critical error processing PDF {pdf_filename}: {e}", exc_info=True)
+                finally:
+                    if pdf_image_dir_path.exists() and not args.keep_images:
+                        try: shutil.rmtree(pdf_image_dir_path); logger.info(f"Cleaned up PDF image directory: {pdf_image_dir_path}")
+                        except Exception as e_clean: logger.error(f"Error cleaning up PDF image dir {pdf_image_dir_path}: {e_clean}")
+                    elif pdf_image_dir_path and args.keep_images: logger.info(f"Keeping PDF image directory due to --keep-images flag: {pdf_image_dir_path}")
+
+                logger.info(f"--- Finished processing for PDF: {pdf_filename} ---")
+
+        # --- Final cleanup of the main temp image subdir (outside executor context) ---
         if images_base_dir.exists() and not args.keep_images:
             try:
-                # Check if it's empty first (might be if all subdirs were cleaned)
-                if not any(images_base_dir.iterdir()):
-                     images_base_dir.rmdir()
-                     logger.info(f"Cleaned up empty base image directory: {images_base_dir}")
-                else: # Should not happen if sub-cleanups work, but just in case
-                     logger.warning(f"Base image directory {images_base_dir} not empty after processing, leaving it.")
-            except Exception as e_clean_base:
-                 logger.error(f"Error during final cleanup of base image directory {images_base_dir}: {e_clean_base}")
-        elif images_base_dir.exists() and args.keep_images:
-            logger.info(f"Keeping base image directory due to --keep-images flag: {images_base_dir}")
+                if not any(images_base_dir.iterdir()): images_base_dir.rmdir(); logger.info(f"Cleaned up empty base image directory: {images_base_dir}")
+                else: logger.warning(f"Base image directory {images_base_dir} not empty after processing, leaving it.")
+            except Exception as e_clean_base: logger.error(f"Error during final cleanup of base image directory {images_base_dir}: {e_clean_base}")
+        elif images_base_dir.exists() and args.keep_images: logger.info(f"Keeping base image directory due to --keep-images flag: {images_base_dir}")
 
         logger.info("All PDF processing finished.")
 
@@ -1757,7 +1593,7 @@ if __name__ == "__main__":
     DEFAULT_DPI = 300
 
     parser = argparse.ArgumentParser(
-        description="Transcribe text from book page images or PDFs using Owl/CAMEL-AI.",
+        description="Transcribe text from book page images or PDFs using Owl/CAMEL-AI with async composite generation.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -1777,7 +1613,7 @@ if __name__ == "__main__":
         help=f"Append to the output file(s). Reads context from end of existing file(s).\n"
               f"In --book-dir mode, also checks for '{END_MARKER}' to skip completed PDFs\n"
               f"and uses '{RESUME_STATE_FILENAME}' in the output dir to resume incomplete ones,\n"
-              f"including previously detected page ranges." # Updated help text
+              f"including previously detected page ranges."
     )
     parser.add_argument("--start-page", type=int, help="Manually specify the first page number (1-based, inclusive) to process. Overrides auto-detection and state.")
     parser.add_argument("--end-page", type=int, help="Manually specify the last page number (1-based, inclusive) to process. Overrides auto-detection and state.")
@@ -1791,7 +1627,7 @@ if __name__ == "__main__":
         help=f"Model string for TOC analysis (default: '{DEFAULT_ANALYSIS_MODEL}'). Used only in --book-dir mode if --start/--end-page are not provided AND range not found in state."
     )
     parser.add_argument(
-        "--image-format", default=DEFAULT_IMAGE_FORMAT, choices=['png', 'jpeg', 'tiff', 'ppm'], # Added choices
+        "--image-format", default=DEFAULT_IMAGE_FORMAT, choices=['png', 'jpeg', 'tiff', 'ppm'],
         help=f"Format for temporary images generated from PDFs (default: {DEFAULT_IMAGE_FORMAT})."
     )
     parser.add_argument(
@@ -1822,53 +1658,28 @@ if __name__ == "__main__":
 Example Usage:
   # Images (pre-generated) -> Single file (overwrite)
   python %(prog)s --input-dir path/to/pages -o output.txt
-  # Images (pre-generated) -> Console
-  python %(prog)s --input-dir path/to/pages
-  # Images (pre-generated) -> Single file (append, specific model)
-  python %(prog)s --input-dir path/to/pages -o output.txt --append --transcription-model {DEFAULT_TRANSCRIPTION_MODEL}
-
-  # PDFs -> Specific output dir (AUTO page range [or state], overwrite)
+  # PDFs -> Specific output dir (AUTO page range [or state], overwrite, ASYNC)
   python %(prog)s --book-dir path/to/pdfs -o path/to/output_dir
-  # PDFs -> Default output dir 'books_tts' (AUTO page range [or state], overwrite)
-  python %(prog)s --book-dir path/to/pdfs
-  # PDFs -> Specific dir (AUTO page range [or state], append/resume, specific models, jpeg format)
-  python %(prog)s --book-dir path/to/pdfs -o path/to/output_dir --append \\
-    --transcription-model {DEFAULT_TRANSCRIPTION_MODEL} --analysis-model {DEFAULT_ANALYSIS_MODEL} \\
-    --image-format jpeg --dpi 200
-  # PDFs -> Specific dir (MANUAL page range, append/resume)
+  # PDFs -> Default output dir 'books_tts' (AUTO page range [or state], append/resume, ASYNC)
+  python %(prog)s --book-dir path/to/pdfs --append
+  # PDFs -> Specific dir (MANUAL page range, append/resume, ASYNC)
   python %(prog)s --book-dir path/to/pdfs --start-page 50 --end-page 150 -o path/to/output_dir --append
-  # PDFs -> Default dir (AUTO page range [or state], debug, append/resume, keep images)
-  python %(prog)s --book-dir path/to/pdfs --log-level DEBUG --append --keep-images
 
 Notes:
 - Requires 'pdftoppm' (from poppler-utils) and 'montage' (from ImageMagick).
 - Requires 'PyPDF2' (`pip install pypdf2`).
-- **PDF Mode (--book-dir):** Images are generated on-the-fly for pages needed in the 3-page transcription window. Older images are deleted automatically unless --keep-images is used.
-- **Image Mode (--input-dir):** Assumes images are already generated and correctly named (e.g., 'prefix-001.png', 'prefix-002.png'). Does not use the rolling window optimization. Requires images sorted numerically by page number in filename. Does not use state file or page range detection.
+- **PDF Mode (--book-dir):** Images generated on-the-fly. Composite image generation runs in parallel with transcription.
+- **Image Mode (--input-dir):** Assumes images already generated. Does not use async composite generation.
 - Configure API keys in a .env file.
-- Use model strings matching CAMEL's ModelType enum values or supported unified strings (like 'provider/model-name').
-- Auto page range detection (in --book-dir mode without --start/--end-page):
-    - Uses PyPDF2 to extract the Table of Contents (outline).
-    - Uses the --analysis-model to determine the main content page range, excluding front/back matter.
-    - Falls back to processing all pages if TOC extraction or analysis fails.
-    - **Detected range is saved to the state file ({RESUME_STATE_FILENAME}) and reused on subsequent runs unless overridden by --start/--end-page.**
-- --append mode (for --book-dir):
-    - Checks for '{END_MARKER}' in existing .txt files to skip completed PDFs.
-    - Uses '{RESUME_STATE_FILENAME}' in output dir to resume incomplete PDFs from last successful page **and** uses the stored detected page range (if present).
-    - State is updated after *each* successful page transcription/skip.
-    - Completed PDFs are removed from the state file.
-- Interrupted processes in PDF mode may leave temporary image directories ({TEMP_IMAGE_SUBDIR}). Use --keep-images to prevent cleanup.
+- Auto page range detection (in --book-dir mode without --start/--end-page) uses TOC extraction and analysis model.
+- --append mode (for --book-dir) uses '{END_MARKER}' and '{RESUME_STATE_FILENAME}' for skipping/resuming.
 {model_help_epilog}
 """
     parsed_args = parser.parse_args()
 
-    # Check ImageMagick early if processing PDFs
-    if parsed_args.book_dir and shutil.which("montage") is None:
-        logger.critical("Critical Error: 'montage' command not found (required for PDF processing). Please install ImageMagick.")
-        sys.exit(1)
-    # Check poppler-utils early if processing PDFs
-    if parsed_args.book_dir and shutil.which("pdftoppm") is None:
-        logger.critical("Critical Error: 'pdftoppm' command not found (required for PDF processing). Please install poppler-utils.")
+    # Check ImageMagick/poppler early if processing PDFs
+    if parsed_args.book_dir and (shutil.which("montage") is None or shutil.which("pdftoppm") is None):
+        logger.critical("Critical Error: 'montage' (ImageMagick) and/or 'pdftoppm' (poppler-utils) not found. Both are required for PDF processing (--book-dir mode).")
         sys.exit(1)
 
     try:
