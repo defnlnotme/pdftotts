@@ -800,7 +800,7 @@ def process_pdf_pages(
              except (AttributeError, ValueError, TypeError) as e_parse: logger.warning(f"Could not parse page num from {img_path.name} for final cleanup: {e_parse}")
              except Exception as e_final_del: logger.warning(f"Error in final cleanup helper for {img_path.name}: {e_final_del}")
 
-        if temp_composite_dir.exists() and not args.keep_images: # Check keep flag
+        if temp_composite_dir.exists():
             try: shutil.rmtree(temp_composite_dir); logger.debug(f"Cleaned up composites directory: {temp_composite_dir}")
             except OSError as e_final_clean: logger.warning(f"Could not clean up composites directory {temp_composite_dir}: {e_final_clean}")
 
@@ -1241,7 +1241,7 @@ def run_main_logic(args):
                     if resume_state_file_path and pdf_filename in current_state_data:
                          logger.info(f"Removing completed '{pdf_filename}' from resume state.")
                          del current_state_data[pdf_filename]; save_resume_state(resume_state_file_path, current_state_data)
-                    if pdf_image_dir_path.exists() and not args.keep_images:
+                    if pdf_image_dir_path.exists():
                         try: shutil.rmtree(pdf_image_dir_path); logger.debug("Cleaned leftover image dir.")
                         except OSError as e_clean: logger.warning(f"Could not clean leftover dir {pdf_image_dir_path}: {e_clean}")
                     continue
@@ -1331,19 +1331,19 @@ def run_main_logic(args):
 
                 except Exception as e: logger.critical(f"Critical error processing PDF {pdf_filename}: {e}", exc_info=True)
                 finally:
-                    if pdf_image_dir_path.exists() and not args.keep_images:
+                    if pdf_image_dir_path.exists():
                         try: shutil.rmtree(pdf_image_dir_path); logger.info(f"Cleaned up PDF image directory: {pdf_image_dir_path}")
                         except Exception as e_clean: logger.warning(f"Error cleaning image dir {pdf_image_dir_path}: {e_clean}")
-                    elif pdf_image_dir_path and args.keep_images: logger.info(f"Keeping image dir: {pdf_image_dir_path}")
+                    elif pdf_image_dir_path: logger.info(f"Keeping image dir: {pdf_image_dir_path}")
                 logger.info(f"--- Finished PDF: {pdf_filename} ---")
 
         # --- Cleanup after PDF loop ---
-        if images_base_dir.exists() and not args.keep_images:
+        if images_base_dir.exists():
             try:
                 if not any(images_base_dir.iterdir()): images_base_dir.rmdir(); logger.info(f"Cleaned up empty base image directory: {images_base_dir}")
                 else: logger.warning(f"Base image directory {images_base_dir} not empty, تركها.")
             except Exception as e_clean_base: logger.error(f"Error cleaning base image directory {images_base_dir}: {e_clean_base}")
-        elif images_base_dir.exists() and args.keep_images: logger.info(f"Keeping base image directory: {images_base_dir}")
+        elif images_base_dir.exists(): logger.info(f"Keeping base image directory: {images_base_dir}")
 
         logger.info("All PDF processing finished.")
 
@@ -1366,7 +1366,6 @@ if __name__ == "__main__":
     parser.add_argument("--image-format", default='png', choices=['png', 'jpeg', 'tiff', 'ppm'], help="Format for generated PDF images (default: png).")
     parser.add_argument("--dpi", type=int, default=300, help="Resolution (DPI) for generated PDF images (default: 300).")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level (default: INFO).")
-    parser.add_argument("--keep-images", action="store_true", help=f"Keep temporary PDF image directories (in '{TEMP_IMAGE_SUBDIR}').")
 
     # Generate epilog (remains the same, but add failover note)
     try:
